@@ -259,22 +259,137 @@ Spring에서는 `@Transactional` 를 사용하면 아래 예시 코드와 같이
   }
   ```
 - 장점
-    - Pessimistic Lock은 타임아웃을 구현하기 어려우나, NamedLock은 타임 아웃 쉽게 구현 가능
+    - Pessimistic Lock은 타임아웃을 구현하기 어려우나, NamedLock은 타임아웃 쉽게 구현 가능
     - NamedLock은 주로 분산락을 구현할 때 사용
         - 특정 '이름'을 잠가 여러 서버나 프로세스 간의 자원 접근을 동기화하거나, 특정 작업의 중복 실행을 방지하는 분산 락 구현에 유용
         - 데이터 삽입 시에 정합성을 맞춰야하는 경우에도 사용 가능
 - 단점
-    - 트랜잭션 종료 시에 락 해제, 세션 관리를 주의해서 사용해야함
+    - 트랜잭션 종료 시에 락 해제 필요. 세션 관리를 주의해서 사용해야함
     - 구현 방법이 복잡할 수 있음
 
 ### 정리
 - 충돌이 빈번하게 일어나는 경우 Pessimistic Lock 추천, 그렇지 않은 경우 Optimistic Lock
 
 ## Redis 활용하기
+분산락을 구현할 때 사용하는 대표적인 라이브러리 2가지
+1. Lettuce
+2. Redisson  
 
+두 라이브러리는 분산 시스템에서 여러 스레드/프로세스가 공유 자원에 안전하게 접근하도록 돕는 분산 락 기능을 제공한다
+
+### Lettuce  
+- setnx 명령어를 활용하여 분산락 구현
+    - `set if not exist`의 줄임말. key와 value를 set할 때, 기존의 값이 없는 경우에만 set
+- spin lock 방식으로 개발자가 retry 로직을 작성 필요
+    - spin lock이란 락을 획득하려는 스레드가 락을 사용할 수 있는지 반복적으로 확인하면서 락 획득을 시도하는 방식
+- MySQL Named Lock과 거의 유사하나, redis를 사용한다는 점 + session 관리에 신경쓰지 않아도 된다는 점이 다르다
+- [예시 코드](https://github.com/SuyeonChoi/stock-system/commit/45af3f8dbec390202ff055e1bb2d06181d80c361)
+  ```java
+    @Component
+    public class RedisLockRepository {
+        private RedisTemplate<String, String> redisTemplate;
+        //..
+        public Boolean lock(Long key) {
+            return redisTemplate
+                    .opsForValue()
+                    .setIfAbsent(generateKey(key), "lock", Duration.ofMillis(3_000));
+        }
+    
+        public Boolean unlock(Long key) {
+            return redisTemplate.delete(generateKey(key));
+        }
+    
+        private String generateKey(Long key) {
+            return key.toString();
+        }
+    }
+    
+    @Component
+    public class LettuceLockStockFacade {
+        public void decrease(Long id, Long quantity) throws InterruptedException {
+            // 락 획득 시도
+            while (!redisLockRepository.lock(id)) {
+                // 락을 획득하지 못한 경우 sleep 후 재시도
+                Thread.sleep(100); // redis 부하 방지
+            }
+    
+            // 락 획득에 성공하면 재고 감소
+            try {
+                stockService.decrease(id, quantity);
+            } finally {
+                redisLockRepository.unlock(id); // 락 해제
+            }
+        }
+    }
+  ```
+- 장점
+  - 구현이 간단함
+- 단점
+  - 스핀락 방식이므로 레디스에 부하를 줄 수 있음. 그래서 락 획득 재시도 간에 Thread.sleep()
+
+### Redisson
+- pub-sub 기반으로 Lock 구현 제공
+    - 레디스는 자신이 점유하고 있는 락을 해제할 때 채널에 메세지를 보내줌으로써 락을 획득해야하는 스레드들에게 락 획득을 하라고 전달해줌
+    - 안내를 받은 스레드는 메세지를 받았을 때 락 획득 시도
+- Lettuce 달리 별도의 retry 로직을 작성하지 않아도 됨
+- Lettuce는 계속 락 획득을 시도하는 반면 레디스는 락 해제가 되었을 때 한번 혹은 몇번만 시도를 하므로 redis에 부하를 줄여줌
+- Redisson 경우에는 락 관련된 클래스들을 라이브러리에서 제공해줘서 별도의 레포지토리를 작성하지 않아도 됨. 로직 실행 전후로 락 획득 해제는 필요
+- 예제 코드
+  ```java
+    @Component
+    public class RedissonLockStockFacade {
+        private RedissonClient redissonClient;
+        private StockService stockService;
+        
+        public void decrease(Long id, Long quantity) {
+            RLock lock = redissonClient.getLock(id.toString()); // // 락 객체 가져오기
+        
+            try {
+                boolean available = lock.tryLock(10, 1, TimeUnit.SECONDS);// 몇 초동안 락 획득을 시도할 것인지, 점유할 것인지 설정
+                if (!available) { // 락 획득에 실패하면 로그 남기고 리턴
+                    System.out.println("lock 획득 실패");
+                    return;
+                }
+                stockService.decrease(id, quantity); // 락을 획득한 경우 재고 감소
+            } catch (InterruptedException e) {
+                throw new RuntimeException(e);
+            } finally {
+                lock.unlock();
+            }
+        }
+    }
+  ```
+- 장점
+  - PubSub 기반의 구현이기 때문에 레디스 부하를 줄여준다
+- 단점
+  - 구현이 다소 복잡
+  - 별도의 라이브러리를 사용해야한다는 부담
+ 
+### Luttuce vs. Redisson
+- Lettuce
+  - 간단한 구현
+  - spring data redis 를 이용하면 lettuce 가 Spring Data Redis의 기본 라이브러리이므로 별도의 라이브러리를 사용하지 않아도 된다.
+  - spin lock 방식이기때문에 동시에 많은 스레드가 lock 획득 대기 상태라면 redis 에 부하가 갈 수 있다.
+- Redisson
+  - 락 획득 재시도를 기본으로 제공한다.
+  - pub-sub 방식으로 구현이 되어있기 때문에 lettuce 와 비교했을 때 redis 에 부하가 덜 간다.
+  - 별도의 라이브러리를 사용해야한다.
+  - lock 을 라이브러리 차원에서 제공해주기 떄문에 라이브러리 사용법을 공부해야 한다.
+- 실무에서는?
+    - 재시도가 필요하지 않은 lock 은 lettuce 활용
+    - 재시도가 필요한 경우에는 redisson 를 활용
 
 ## MySQL vs. Redis 비교 정리
-
+- MySQL
+    - 이미 MySQL 을 사용하고 있다면 별도의 비용없이 사용 가능
+    - 어느 정도의 트래픽까지는 문제없이 활용이 가능하다.
+    - Redis 보다는 성능이 좋지 않다.
+- Redis
+    - 활용중인 Redis 가 없다면 별도의 구축비용과 인프라 관리비용이 발생
+    - MySQL 보다 성능이 좋다. 
+- 실무에서는?
+    - 비용적 여유가 없거나 MySQL로 처리가 가능할 정도의 트래픽이라면 MySQL 활용
+    - 비용적 여유가 있거나 MySQL로 처리가 불가능할 정도의 트래픽이라면 Redis 도입
 
 
 
